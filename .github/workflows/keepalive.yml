@@ -1,0 +1,43 @@
+name: keep-alive
+
+# Pings the public health endpoint every 5 minutes during IST college hours.
+# Lives in a public repo so the cron costs no GitHub Actions minutes.
+#
+# Render Free spins down after 15 minutes without inbound HTTP traffic; the
+# first request after that waits ~50 s. This keeps it warm from 04:00 until
+# midnight, leaving it asleep 00:00-04:00 to stay inside the 750-hour allowance.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check IST college hours
+        id: gate
+        run: |
+          hour=$(TZ=Asia/Kolkata date +%H)
+          if [ "$hour" -ge 4 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ping health endpoint
+        if: steps.gate.outputs.run == 'true'
+        env:
+          HEALTH_URL: ${{ vars.APP_HEALTH_URL || 'https://iare-bus-enroute-api.onrender.com/health' }}
+        run: |
+          echo "Pinging $HEALTH_URL"
+          curl --fail --silent --show-error --retry 3 --retry-delay 10 --max-time 120 "$HEALTH_URL"
