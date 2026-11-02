@@ -1,18 +1,27 @@
 name: keep-alive
 
-# Pings the public health endpoint every 5 minutes during IST college hours.
-# Lives in a public repo so the cron costs no GitHub Actions minutes.
+# Keeps the Render Free instance from cold-starting during college hours.
 #
-# Render Free spins down after 15 minutes without inbound HTTP traffic; the
-# first request after that waits ~50 s. This keeps it warm from 04:00 until
-# midnight, leaving it asleep 00:00-04:00 to stay inside the 750-hour allowance.
+# Why a chain instead of a 5-minute cron: GitHub's scheduled workflows are
+# frequently delayed or dropped (observed: one run in an hour), which is exactly
+# when a rider would meet a ~50 s cold start. Each run here pings every 5
+# minutes for 5.5 hours, then dispatches its own successor. A 30-minute cron is
+# only a watchdog that restarts the chain if it ever dies.
+#
+# Render Free sleeps after 15 minutes without inbound HTTP. Pings run 04:00 to
+# midnight IST only, so the service is awake ~620 h/month against the 750 h
+# allowance.
+#
+# This repository is public, so Actions minutes are unlimited; the application
+# repo is private (2,000 min/month) and would exhaust them in about a week.
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/30 * * * *"   # watchdog only
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: read
 
 concurrency:
@@ -20,24 +29,64 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  ping:
+  chain:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 350
     steps:
-      - name: Check IST college hours
-        id: gate
+      - name: Skip if another segment is already running
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          hour=$(TZ=Asia/Kolkata date +%H)
-          if [ "$hour" -ge 4 ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
+          set -euo pipefail
+          runs=$(curl -sS --max-time 30 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/keepalive.yml/runs?per_page=30")
+          active=$(printf '%s' "$runs" | jq --argjson me "$GITHUB_RUN_ID" \
+            '[.workflow_runs[] | select(.id != $me and (.status == "in_progress" or .status == "queued"))] | length')
+          echo "other active/queued runs: $active"
+          if [ "$active" -gt 0 ]; then
+            echo "duplicate segment, exiting"
             echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Ping health endpoint
-        if: steps.gate.outputs.run == 'true'
+      - name: Ping every 5 minutes, then hand over
+        if: steps.guard.outputs.run == 'true'
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEALTH_URL: ${{ vars.APP_HEALTH_URL || 'https://iare-bus-enroute-api.onrender.com/health' }}
         run: |
-          echo "Pinging $HEALTH_URL"
-          curl --fail --silent --show-error --retry 3 --retry-delay 10 --max-time 120 "$HEALTH_URL"
+          set -uo pipefail
+          start=$(date +%s)
+          deadline=$((start + 19800))   # 5 h 30 min
+          ping=0
+          fail=0
+          while :; do
+            hour=$(TZ=Asia/Kolkata date +%H)
+            if [ "$((10#$hour))" -ge 4 ]; then
+              if curl -fsS --max-time 60 -o /dev/null "$HEALTH_URL"; then
+                ping=$((ping + 1))
+                echo "$(TZ=Asia/Kolkata date +%H:%M:%S) IST ping ok (#$ping)"
+              else
+                fail=$((fail + 1))
+                echo "$(TZ=Asia/Kolkata date +%H:%M:%S) IST ping FAILED (#$fail)"
+              fi
+            else
+              echo "$(TZ=Asia/Kolkata date +%H:%M:%S) IST quiet hours, sleeping"
+            fi
+            now=$(date +%s)
+            [ "$now" -ge "$deadline" ] && break
+            sleep 300
+          done
+          echo "segment complete: $ping pings, $fail failures"
+          echo "dispatching next segment"
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/keepalive.yml/dispatches" \
+            -d '{"ref":"main"}'
+          echo "handover sent"
